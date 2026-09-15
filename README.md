@@ -13,3 +13,6 @@ Wait for the operation to finish and you should see the report view of how long 
 When its done, reset by changing the pattern back to 3x3 and the FEM by deleting the results.
 
 To see the effects of a long run and temperature on the cpu, increase the mesh density or the pattern size.
+If you want to change the size of the pattern, edit rows 71 and 115 of BenchmarkArray.FCMacro from a size 30 to what you desire:
+   row 71: def benchmark_linear_pattern_2d(new_size=30):
+   row 115: benchmark_linear_pattern_2d(30)
