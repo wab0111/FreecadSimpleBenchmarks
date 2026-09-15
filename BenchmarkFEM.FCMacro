@@ -1,0 +1,154 @@
+import FreeCAD as App
+import time
+import os
+import sys
+import subprocess
+import threading
+
+class TempMonitor:
+    def __init__(self):
+        self.running = False
+        self.temps = []
+        self.thread = None
+
+    def _read_temp(self):
+        try:
+            import psutil
+            if hasattr(psutil, 'sensors_temperatures'):
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for name in ['coretemp', 'k10temp', 'zenpower']:
+                        if name in temps and temps[name]:
+                            return float(temps[name][0].current)
+                    for name, entries in temps.items():
+                        if entries:
+                            return float(entries[0].current)
+        except Exception:
+            pass
+
+        if sys.platform.startswith('linux'):
+            try:
+                for i in range(10):
+                    name_path = f"/sys/class/hwmon/hwmon{i}/name"
+                    if os.path.exists(name_path):
+                        with open(name_path, 'r') as f:
+                            name = f.read().strip()
+                        if name in ['k10temp', 'coretemp', 'zenpower']:
+                            with open(f"/sys/class/hwmon/hwmon{i}/temp1_input", 'r') as f:
+                                return float(f.read().strip()) / 1000.0
+                if os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
+                    with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                        return float(f.read().strip()) / 1000.0
+            except Exception:
+                pass
+                
+        return None 
+
+    def _monitor(self):
+        while self.running:
+            t = self._read_temp()
+            if t is not None:
+                self.temps.append(t)
+            time.sleep(0.1)
+
+    def start(self):
+        self.running = True
+        self.temps = []
+        self.thread = threading.Thread(target=self._monitor)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if not self.temps:
+            return None, None
+        return max(self.temps), sum(self.temps) / len(self.temps)
+
+def benchmark_calculix_headless(analysis_name='Analysis'):
+    doc = App.ActiveDocument
+    if not doc:
+        App.Console.PrintError("ERROR: No active document found.\n")
+        return
+
+    analysis_obj = doc.getObject(analysis_name)
+    if not analysis_obj:
+        App.Console.PrintError(f"ERROR: '{analysis_name}' container not found.\n")
+        return
+
+    try:
+        import femtools.ccxtools as ccxtools
+    except ImportError:
+        App.Console.PrintError("ERROR: Could not load FreeCAD FEM tools.\n")
+        return
+
+    App.Console.PrintMessage("\n--- Preparing FEM Benchmark ---\n")
+
+    # 1. Setup and write the input file (not timed)
+    fea = ccxtools.FemToolsCcx(analysis_obj)
+    fea.update_objects()
+    fea.setup_working_dir()
+    fea.setup_ccx()
+    fea.write_inp_file()
+
+    # 2. Find the FreeCAD working directory and the generated .inp file
+    working_dir = fea.working_dir
+    inp_files = [f for f in os.listdir(working_dir) if f.endswith('.inp')]
+    if not inp_files:
+        App.Console.PrintError("ERROR: No .inp file was generated!\n")
+        return
+        
+    inp_files.sort(key=lambda x: os.path.getmtime(os.path.join(working_dir, x)), reverse=True)
+    base_name = inp_files[0][:-4] 
+
+    prefs = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Fem/Ccx")
+    ccx_binary = prefs.GetString("ccxBinaryPath", "ccx")
+
+    App.Console.PrintMessage("Running CalculiX headlessly and monitoring temps...\n")
+
+    # 3. Start timer and monitor
+    monitor = TempMonitor()
+    monitor.start()
+    start_time = time.perf_counter()
+
+    try:
+        # Run headlessly in the background
+        # Note: creationflags=subprocess.CREATE_NO_WINDOW prevents command prompts flashing on Windows
+        kwargs = {}
+        if sys.platform == 'win32':
+            kwargs['creationflags'] = 0x08000000 
+            
+        process = subprocess.Popen([ccx_binary, '-i', base_name], 
+                                   cwd=working_dir, 
+                                   stdout=subprocess.PIPE, 
+                                   stderr=subprocess.PIPE,
+                                   **kwargs)
+        process.communicate() 
+    except Exception as e:
+        monitor.stop()
+        App.Console.PrintError(f"Failed to execute CalculiX: {e}\n")
+        return
+
+    # 4. Stop timer and monitor
+    end_time = time.perf_counter()
+    max_t, avg_t = monitor.stop()
+    elapsed = end_time - start_time
+
+    App.Console.PrintMessage("Loading results...\n")
+    fea.load_results()
+
+    # Format the temperature output based on system compatibility
+    temp_str = f"Max {max_t:.1f}°C | Avg {avg_t:.1f}°C" if max_t is not None else "N/A (Unsupported OS or permissions)"
+
+    # Output the benchmark
+    result_msg = (
+        f"\n========================================\n"
+        f"FEM BENCHMARK COMPLETE\n"
+        f"Time: {elapsed:.4f} seconds\n"
+        f"CPU Temp: {temp_str}\n"
+        f"========================================\n"
+    )
+    App.Console.PrintMessage(result_msg)
+
+# --- EXECUTION ---
+benchmark_calculix_headless('Analysis')

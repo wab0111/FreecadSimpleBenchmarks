@@ -1,0 +1,115 @@
+import FreeCAD as App
+import time
+import os
+import sys
+import threading
+
+class TempMonitor:
+    def __init__(self):
+        self.running = False
+        self.temps = []
+        self.thread = None
+
+    def _read_temp(self):
+        # 1. Try cross-platform psutil (often bundled with FreeCAD)
+        try:
+            import psutil
+            if hasattr(psutil, 'sensors_temperatures'):
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for name in ['coretemp', 'k10temp', 'zenpower']:
+                        if name in temps and temps[name]:
+                            return float(temps[name][0].current)
+                    # Fallback to the first available sensor
+                    for name, entries in temps.items():
+                        if entries:
+                            return float(entries[0].current)
+        except Exception:
+            pass
+
+        # 2. Try native Linux sysfs (Zero overhead, highly reliable)
+        if sys.platform.startswith('linux'):
+            try:
+                for i in range(10):
+                    name_path = f"/sys/class/hwmon/hwmon{i}/name"
+                    if os.path.exists(name_path):
+                        with open(name_path, 'r') as f:
+                            name = f.read().strip()
+                        if name in ['k10temp', 'coretemp', 'zenpower']:
+                            with open(f"/sys/class/hwmon/hwmon{i}/temp1_input", 'r') as f:
+                                return float(f.read().strip()) / 1000.0
+                # Generic Linux fallback
+                if os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
+                    with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                        return float(f.read().strip()) / 1000.0
+            except Exception:
+                pass
+                
+        return None # Unsupported OS or missing permissions
+
+    def _monitor(self):
+        while self.running:
+            t = self._read_temp()
+            if t is not None:
+                self.temps.append(t)
+            time.sleep(0.1)
+
+    def start(self):
+        self.running = True
+        self.temps = []
+        self.thread = threading.Thread(target=self._monitor)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if not self.temps:
+            return None, None
+        return max(self.temps), sum(self.temps) / len(self.temps)
+
+def benchmark_linear_pattern_2d(new_size=30):
+    doc = App.ActiveDocument
+    if not doc:
+        App.Console.PrintError("ERROR: No active document found.\n")
+        return
+
+    pattern_obj = doc.getObject('LinearPattern')
+    if not pattern_obj:
+        App.Console.PrintError("ERROR: Object 'LinearPattern' not found.\n")
+        return
+        
+    App.Console.PrintMessage(f"\nStarting benchmark on LinearPattern ({new_size}x{new_size})...\n")
+
+    # Update occurrences
+    pattern_obj.Occurrences = new_size
+    if hasattr(pattern_obj, 'Occurrences2'):
+        pattern_obj.Occurrences2 = new_size
+
+    # Start timer and temperature monitor
+    monitor = TempMonitor()
+    monitor.start()
+    start_time = time.perf_counter()
+
+    # Force the geometry to rebuild
+    doc.recompute()
+
+    # Stop timer and temperature monitor
+    end_time = time.perf_counter()
+    max_t, avg_t = monitor.stop()
+    elapsed = end_time - start_time
+    
+    # Format the temperature output based on system compatibility
+    temp_str = f"Max {max_t:.1f}°C | Avg {avg_t:.1f}°C" if max_t is not None else "N/A (Unsupported OS or permissions)"
+    
+    result_msg = (
+        f"\n========================================\n"
+        f"GEOMETRY BENCHMARK COMPLETE\n"
+        f"Time: {elapsed:.4f} seconds\n"
+        f"CPU Temp: {temp_str}\n"
+        f"========================================\n"
+    )
+    App.Console.PrintMessage(result_msg)
+
+# --- EXECUTION ---
+benchmark_linear_pattern_2d(30)
